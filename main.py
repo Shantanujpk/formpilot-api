@@ -1,62 +1,53 @@
 # ─── FormPilot FastAPI /fill endpoint ────────────────────────────────────────
 # Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-# Test: POST http://localhost:8000/fill
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, List, Optional, Dict
 import requests
 import json
-import re
 import os
+
 app = FastAPI(title="FormPilot API", version="1.0.0")
 
-# ─── CORS — allow Chrome extension to call this API ──────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # lock this down to your extension origin in prod
+    allow_origins=["*"],
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
-
-# ─── GROQ CONFIG ─────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
-# ─── REQUEST / RESPONSE MODELS ───────────────────────────────────────────────
-
 class Field(BaseModel):
     id: str
     label: str
     type: str
-    options: list[str] = []
+    options: List[str] = []
     tag: str = "INPUT"
 
 class FillRequest(BaseModel):
-    session_id: str                  # any string — used for logging
-    fields: list[Field]
-    user_data: dict[str, Any]
-    entry_num: int | None = None     # pass 2,3,4 for multi-entry sections
+    session_id: str
+    fields: List[Field]
+    user_data: Dict[str, Any]
+    entry_num: Optional[int] = None
 
 class MappedField(BaseModel):
     id: str
     value: str
     type: str
-    action: str                      # "type" | "select" | "check" | "radio"
+    action: str
 
 class FillResponse(BaseModel):
     session_id: str
-    mapping: list[MappedField]
+    mapping: List[MappedField]
     fields_received: int
     fields_mapped: int
 
-# ─── GROQ CALL ───────────────────────────────────────────────────────────────
-def call_groq(fields: list[dict], user_data: dict, entry_num: int | None = None) -> list[dict]:
-
-    # Trim fields for token efficiency
+def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
     fields_for_llm = [
         {
             "id":      f["id"],
@@ -147,8 +138,6 @@ Rules:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Groq call failed: {str(e)}")
 
-# ─── ROUTES ───────────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"status": "FormPilot API running", "version": "1.0.0"}
@@ -159,48 +148,20 @@ def health():
 
 @app.post("/fill", response_model=FillResponse)
 def fill(req: FillRequest):
-    """
-    Main endpoint. Chrome extension sends scanned fields + user data.
-    Returns field mapping with values and actions for the extension to execute.
-
-    Request:
-    {
-        "session_id": "abc123",
-        "fields": [{"id": "firstName", "label": "First Name", "type": "text", "options": [], "tag": "INPUT"}],
-        "user_data": {"first_name": "Shantanu", ...},
-        "entry_num": null
-    }
-
-    Response:
-    {
-        "session_id": "abc123",
-        "mapping": [{"id": "firstName", "value": "Shantanu", "type": "text", "action": "type"}],
-        "fields_received": 1,
-        "fields_mapped": 1
-    }
-    """
-
     if not req.fields:
         raise HTTPException(status_code=400, detail="No fields provided")
-
     if not req.user_data:
         raise HTTPException(status_code=400, detail="No user_data provided")
 
-    # Convert Pydantic models to dicts for Groq
     fields_dict = [f.model_dump() for f in req.fields]
-
-    # Call Groq
     raw_mapping = call_groq(fields_dict, req.user_data, req.entry_num)
 
-    # Normalise — ensure action field exists
     mapping = []
     for m in raw_mapping:
         if not m.get("id") or not m.get("value"):
             continue
-
         field_type = m.get("type", "text")
         action = m.get("action") or _infer_action(field_type)
-
         mapping.append(MappedField(
             id     = m["id"],
             value  = str(m["value"]),
@@ -209,10 +170,10 @@ def fill(req: FillRequest):
         ))
 
     return FillResponse(
-        session_id     = req.session_id,
-        mapping        = mapping,
+        session_id      = req.session_id,
+        mapping         = mapping,
         fields_received = len(req.fields),
-        fields_mapped  = len(mapping)
+        fields_mapped   = len(mapping)
     )
 
 def _infer_action(field_type: str) -> str:
@@ -223,4 +184,3 @@ def _infer_action(field_type: str) -> str:
     if field_type == "radio":
         return "radio"
     return "type"
-
