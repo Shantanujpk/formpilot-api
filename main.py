@@ -48,7 +48,6 @@ class FillResponse(BaseModel):
 
 def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
 
-    # Read key fresh every call — ensures Railway env var is always used
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
     if not groq_api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in environment")
@@ -167,8 +166,16 @@ def fill(req: FillRequest):
     if not req.user_data:
         raise HTTPException(status_code=400, detail="No user_data provided")
 
+    # ── LOG what we received — visible in Railway Deploy Logs ──
+    print(f"[SESSION {req.session_id}] Fields received: {len(req.fields)}")
+    print(f"[SESSION {req.session_id}] User data keys: {list(req.user_data.keys())}")
+    print(f"[SESSION {req.session_id}] Full request: {json.dumps(req.model_dump(), indent=2)}")
+
     fields_dict = [f.model_dump() for f in req.fields]
     raw_mapping = call_groq(fields_dict, req.user_data, req.entry_num)
+
+    # ── LOG what Groq returned ──
+    print(f"[SESSION {req.session_id}] Groq mapping ({len(raw_mapping)} fields): {json.dumps(raw_mapping, indent=2)}")
 
     mapping = []
     for m in raw_mapping:
