@@ -18,9 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 
 class Field(BaseModel):
     id: str
@@ -48,6 +47,12 @@ class FillResponse(BaseModel):
     fields_mapped: int
 
 def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
+
+    # Read key fresh every call — ensures Railway env var is always used
+    groq_api_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in environment")
+
     fields_for_llm = [
         {
             "id":      f["id"],
@@ -107,7 +112,7 @@ Rules:
         response = requests.post(
             GROQ_URL,
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Authorization": f"Bearer {groq_api_key}",
                 "Content-Type":  "application/json"
             },
             json={
@@ -145,6 +150,15 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/debug")
+def debug():
+    key = os.environ.get("GROQ_API_KEY", "NOT SET")
+    return {
+        "key_set": bool(key and key != "NOT SET"),
+        "key_length": len(key),
+        "key_start": key[:10] if key else "empty"
+    }
 
 @app.post("/fill", response_model=FillResponse)
 def fill(req: FillRequest):
