@@ -70,7 +70,7 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
     if entry_num is not None:
         entry_hint = f"\nIMPORTANT: You are filling entry number {entry_num}. Use exp{entry_num} or edu{entry_num} data.\n"
 
-    prompt = f"""You are a form filling agent. Map user data to form fields semantically.
+    prompt = f"""You are a form filling agent. Map user data to form fields.
 {entry_hint}
 USER DATA:
 {json.dumps(user_data, indent=2)}
@@ -79,30 +79,11 @@ FORM FIELDS:
 {json.dumps(fields_for_llm, indent=2)}
 
 Rules:
-- Be aggressive — map every field that reasonably relates to user data
-- email → email, phone → phone/mobile, city → city, address → address_line1
-- state → state, country → country, postal code / pincode → postal_code
-- first name → first_name, last name → last_name, middle name → middle_name
-- father name → father_name, mother name → mother_name
-- date of birth / dob → dob
-- gender → gender, nationality → nationality
-- linkedin → linkedin_url, website → website_url
-- skills → use skills_list as comma string
-- field of study / major → edu field value
-- visa details / provide details → visa_details value ONLY
-- ethnicity → ethnicity_us, disability → disability
-- veteran → veteran_status
-- same as / same as permanent → true (agent handles automatically)
-- For select fields value MUST exactly match one of the available options
-- work authorization → Yes, sponsorship → Yes, non-compete → No
-- government employee → No, export control → No
-- acknowledge or agree → Yes, pick matching option
-- If two fields have identical labels use field_id to differentiate
-- HeightInCMS → height value, Weight → weight value
-- Field ID is more reliable than label for semantic mapping
-- percentageGrade → percentage, expYears → years of experience
-- payScale / gradePay / basicPay → respective salary fields
-- Only skip if genuinely no related data exists
+- Map every field that relates to user data — use semantic understanding
+- For select fields, value MUST exactly match one of the available options
+- Field ID is more reliable than label for mapping
+- If user_data has a full name and form has separate first/last fields, split intelligently
+- Only skip a field if there is genuinely no related data
 - Return ONLY a JSON array. No explanation. No markdown. No code fences.
 
 [{{"id":"field_id","value":"fill_value","type":"field_type","action":"type_or_select_or_check_or_radio"}}]"""
