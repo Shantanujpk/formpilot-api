@@ -1,7 +1,7 @@
 # ─── FormPilot FastAPI /fill endpoint ────────────────────────────────────────
 # Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, List, Optional, Dict
@@ -18,6 +18,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── RAW REQUEST LOGGER — catches request BEFORE Pydantic validation ──────────
+# This logs even 422 errors so we can see exactly what was sent
+@app.middleware("http")
+async def log_raw_requests(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/fill":
+        body = await request.body()
+        print(f"[RAW REQUEST BODY] {body.decode('utf-8')}")
+    response = await call_next(request)
+    return response
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -29,7 +39,7 @@ class Field(BaseModel):
     tag: str = "INPUT"
 
 class FillRequest(BaseModel):
-    session_id: str
+    session_id: str = "default"   # optional now — defaults to "default"
     fields: List[Field]
     user_data: Dict[str, Any]
     entry_num: Optional[int] = None
@@ -147,7 +157,6 @@ def fill(req: FillRequest):
     if not req.user_data:
         raise HTTPException(status_code=400, detail="No user_data provided")
 
-    # ── LOG what we received — visible in Railway Deploy Logs ──
     print(f"[SESSION {req.session_id}] Fields received: {len(req.fields)}")
     print(f"[SESSION {req.session_id}] User data keys: {list(req.user_data.keys())}")
     print(f"[SESSION {req.session_id}] Full request: {json.dumps(req.model_dump(), indent=2)}")
@@ -155,7 +164,6 @@ def fill(req: FillRequest):
     fields_dict = [f.model_dump() for f in req.fields]
     raw_mapping = call_groq(fields_dict, req.user_data, req.entry_num)
 
-    # ── LOG what Groq returned ──
     print(f"[SESSION {req.session_id}] Groq mapping ({len(raw_mapping)} fields): {json.dumps(raw_mapping, indent=2)}")
 
     mapping = []
