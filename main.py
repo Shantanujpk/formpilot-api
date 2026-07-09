@@ -1,4 +1,4 @@
-# ─── FormPilot FastAPI /fill endpoint (Groq, Gemini-equivalent) ──────────────
+# ─── FormPilot FastAPI /fill endpoint (Groq) ─────────────────────────────────
 # Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 from fastapi import FastAPI, HTTPException, Request
@@ -9,7 +9,7 @@ import requests
 import json
 import os
 
-app = FastAPI(title="FormPilot API", version="2.0.0")
+app = FastAPI(title="FormPilot API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,25 +30,44 @@ async def log_raw_requests(request: Request, call_next):
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 
-# ── SYSTEM INSTRUCTION — ported verbatim from the Gemini service ─────────────
-SYSTEM_INSTRUCTION = """You are an expert AI form filler designed to map user data to complex web forms, especially Indian forms.
-Your job is to match the provided User Data to the corresponding form fields.
-Handle transliteration if needed (e.g., English to Marathi/Hindi).
-Handle date format differences (User Data might be YYYY-MM-DD, form might need DD/MM/YYYY or vice versa. Always respect the placeholder or pattern).
-Handle first/last name splitting if the form has separate fields.
-Handle nested dropdown mapping (e.g., State -> District). For dropdowns, use the closest matching option text or value provided in the options array.
+# ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
+# The old prompt only said "match/handle" and never said "don't invent", so the
+# model helpfully filled sections with no backing data (e.g. Employment =
+# "Assistant Manager", SSC "Attempts = 1", "Seat/Roll No = 12345"). This version
+# forbids fabrication while still allowing legitimate TRANSFORMS of real data
+# (date reformat, name split, transliteration, dropdown option matching).
+SYSTEM_INSTRUCTION = """You are an expert AI form filler that maps a user's REAL data to web form fields, especially Indian government forms.
+
+ABSOLUTE RULE — NEVER FABRICATE:
+- Only output a field if its value comes DIRECTLY from the provided userData.
+- If userData does NOT contain information for a field, OMIT that field entirely from your output. Do NOT guess. Do NOT invent. Do NOT use plausible defaults.
+- Never output placeholder or example values (e.g. "1", "12345", "Assistant Manager", "First Class", "Passed", "N/A", "Yes", "No") unless that exact value is present in userData.
+- If a whole section of the form has no corresponding data in userData (e.g. employment, education, salary, qualifications), return NOTHING for that entire section. An empty result for those fields is the CORRECT and desired behavior.
+- It is always better to leave a field blank than to fill it with a value that is not in userData.
+
+WHAT IS ALLOWED (these are NOT fabrication — they transform data the user already has):
+- Reformatting dates (e.g. userData "2000-06-29" -> form needs "29/06/2000"). Respect the field's placeholder/pattern.
+- Splitting or combining names the user provided (first/middle/last <-> full name).
+- Transliteration of a provided value (e.g. English name -> Marathi/Hindi script).
+- Choosing the closest matching option TEXT/VALUE from a dropdown's provided options, for a value the user actually has (e.g. userData state "Maharashtra" -> the "MAHARASHTRA" option).
+- Normalizing case/spacing of a value the user provided (e.g. "FEMALE" -> "Female").
+
+DECISION TEST for every field: "Is this value present in, or a direct transformation of, something in userData?"
+- YES -> output it.
+- NO  -> omit the field. (Do not include it in the array at all.)
 
 Input Format:
-- "fields": Array of form fields with metadata.
-- "userData": The user's information.
-- "entryNum": (Optional) The index of the entry if filling multiple forms (like sibling 1, sibling 2).
+- "fields": array of form fields with metadata.
+- "userData": the user's REAL information (the ONLY source of truth).
+- "entryNum": (optional) index for multi-entry forms.
 
 Output Format:
-Return a JSON array of objects, where each object has:
-- id: The exact id of the field provided.
-- value: The mapped value to fill in. For select/dropdown fields, provide the exact option value if known, or the text if value is not provided.
-- action: The action to perform ("type", "select", "check", "radio", "search_and_select").
+Return a JSON array of objects, each with:
+- id: the exact id of the field provided.
+- value: the mapped value (present in or transformed from userData).
+- action: one of "type", "select", "check", "radio", "search_and_select".
 
+Only include fields you are filling from real userData. Omit everything else.
 Return ONLY the JSON array. No explanation, no markdown, no code fences."""
 
 
@@ -177,7 +196,7 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "2.0.0"}
+    return {"status": "FormPilot API running", "version": "2.1.0"}
 
 
 @app.get("/health")
