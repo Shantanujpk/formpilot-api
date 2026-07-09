@@ -49,9 +49,13 @@ LLM_URL = "https://api.cerebras.ai/v1/chat/completions"
 # Cerebras uses the same key env var name we set on Railway:
 LLM_API_KEY_ENV = "CEREBRAS_API_KEY"
 
-# Some providers/models reject the response_format param. If set False and the
-# model still returns clean JSON via the prompt, we parse it fine. Toggle if needed.
-USE_JSON_RESPONSE_FORMAT = True
+# Some providers/models reject or misinterpret the response_format param.
+# Cerebras gpt-oss-120b returns a JSON-SCHEMA fragment ({"type":"object"}) when
+# response_format is set, instead of our data. So we DISABLE it and rely on the
+# prompt (which already says "return ONLY a JSON array"). Cerebras also supports
+# passing a strict schema via response_format, but prompt-driven JSON is simpler
+# and works here.
+USE_JSON_RESPONSE_FORMAT = False
 
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
 SYSTEM_INSTRUCTION = """You are an expert AI form filler that maps a user's REAL data to web form fields, especially Indian government forms.
@@ -86,7 +90,7 @@ Return a JSON array of objects, each with:
 - action: one of "type", "select", "check", "radio", "search_and_select".
 
 Only include fields you are filling from real userData. Omit everything else.
-Return ONLY the JSON array. No explanation, no markdown, no code fences."""
+Return ONLY the JSON array — start your response with the character [ and end with ]. Do NOT include any reasoning, explanation, markdown, code fences, or schema. Output the raw JSON array and nothing else."""
 
 
 class Field(BaseModel):
