@@ -78,7 +78,9 @@ Judge by MEANING, not by matching key names to field names. The userData key and
 - Compute a value that is a pure function of provided data (e.g. an age from a date of birth).
 - Transliterate a provided value into the script the field expects.
 - Match a provided value to the closest option of a dropdown/radio (by option text or value).
-- DECOMPOSE COMPOSITE FIELDS: when the user has a combined value (such as a full postal address, a full name, or any multi-part string) and the form asks for its individual components, extract each component from the combined value. A single real-world entity can legitimately satisfy several differently-named fields when it is the correct value for each. If a requested component is genuinely absent from the data, omit that one field.
+- DECOMPOSE COMPOSITE FIELDS: when the user has a combined value (a full postal address, a full name, or any multi-part string) and the form asks for its individual components, extract each component from the combined value. For an address, split it on its separators (commas, dashes) and map each segment to the field it fits: house/door number, building/society, road/area, landmark, village/town/city, taluka/tehsil/sub-district, district, state, pincode. Work from the WHOLE combined value, not just one convenient token.
+- ONE VALUE CAN FILL SEVERAL FIELDS: a single real-world entity can be the correct answer for more than one differently-named field. If the data provides only one place name and the form asks for several administrative levels (e.g. both District and Village/City, or both Taluka and District) with no finer value to separate them, use that same place name for each field it correctly answers rather than filling one and leaving the rest blank. Do not "use up" a value on a single field. This reuse is DERIVATION (the value traces to real data), not invention.
+- Only omit an address-level field when the combined value genuinely contains nothing that fits it.
 
 ════════ WHAT COUNTS AS INVENTED (never output) ════════
 - Any value for a field about a topic the userData does not cover (e.g. education, employment, family, financial, or eligibility details that were never provided).
@@ -97,6 +99,7 @@ Judge by MEANING, not by matching key names to field names. The userData key and
 Return ONLY a raw JSON array — start with [ and end with ]. No reasoning, no explanation, no markdown, no code fences, no schema object.
 Each element: {"id": "<exact field id>", "value": "<derived value>", "action": "type|select|check|radio|search_and_select", "source": "<comma-separated userData key(s) this value derives from>"}
 Include only fields you can source from userData. Omit all others. If nothing can be sourced, return []."""
+
 
 class Field(BaseModel):
     id: Optional[str] = None
