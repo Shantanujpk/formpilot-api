@@ -1,5 +1,17 @@
-# ─── FormPilot FastAPI /fill endpoint (Groq) ─────────────────────────────────
+# ─── FormPilot FastAPI /fill endpoint (Cerebras) ─────────────────────────────
 # Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+#
+# PROVIDER: Cerebras (US-based, OpenAI-compatible). Chosen over Groq because
+# Groq's free tier TPM (12K/min, 100K/day) kept rate-limiting us and the paid
+# Developer upgrade was unavailable. Cerebras free tier gives ~1M tokens/hour
+# AND ~1M/day, 30K TPM, 65,536 context on gpt-oss-120b — far more headroom.
+#
+# MODEL: gpt-oss-120b (OpenAI's open 120B model, "Production" on Cerebras).
+# Bigger than the Llama 3.3 70B we ran on Groq, so it should follow the
+# no-fabricate rule at least as well and fix the 8B hallucination.
+#
+# ENV VAR NEEDED ON RAILWAY:  CEREBRAS_API_KEY
+# (You can leave the old GROQ_API_KEY set too — it's just unused now.)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +21,7 @@ import requests
 import json
 import os
 
-app = FastAPI(title="FormPilot API", version="2.2.0")
+app = FastAPI(title="FormPilot API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,14 +39,15 @@ async def log_raw_requests(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# ── MODEL SELECTION ──────────────────────────────────────────────────────────
-# One-line toggle. 8B "instant" is the cheapest model and stretches the free-tier
-# TPM the furthest; mapping is an easy task it handles well. If quality drops on
-# tricky dropdowns/transliteration, flip this back to "llama-3.3-70b-versatile".
-GROQ_MODEL = "llama-3.1-8b-instant"
-# GROQ_MODEL = "llama-3.3-70b-versatile"   # <- revert here if 8b isn't sharp enough
+# ── PROVIDER / MODEL SELECTION (Cerebras, OpenAI-compatible) ─────────────────
+# One-line toggle. gpt-oss-120b is the biggest + Production-grade free model.
+# If its mapping style doesn't suit your forms, try "gemma-4-31b" (also free).
+LLM_MODEL = "gpt-oss-120b"
+# LLM_MODEL = "gemma-4-31b"          # <- smaller free fallback
 
-GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+LLM_URL = "https://api.cerebras.ai/v1/chat/completions"
+# Cerebras uses the same key env var name we set on Railway:
+LLM_API_KEY_ENV = "CEREBRAS_API_KEY"
 
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
 SYSTEM_INSTRUCTION = """You are an expert AI form filler that maps a user's REAL data to web form fields, especially Indian government forms.
@@ -108,20 +121,18 @@ class FillResponse(BaseModel):
 
 
 def _normalize_options(options: List[Any]) -> List[Any]:
-    """Keep option objects intact (like Gemini) but cap them for token safety."""
+    """Keep option objects intact but cap them for token safety."""
     return options[:25]
 
 
 def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     PAYLOAD TRIM: the mapper only needs the user's actual values.
-    Incoming user_data often carries baggage the model never uses:
-      - formFillInstructions : stale output from the old popup/Gemini path (wrong form)
-      - processedDocuments   : raw per-document data already merged into extractedFields
-      - formId               : routing id, irrelevant to mapping
-    We send ONLY extractedFields (plus any top-level manual values). Falls back to
-    the whole user_data if extractedFields isn't present, so nothing breaks whether
-    the payload is fat (current) or lean (after popup.js is trimmed).
+    Drops baggage the model never uses (formFillInstructions = stale old-path
+    output, processedDocuments = raw per-doc data already merged, formId = routing
+    id). Sends ONLY extractedFields (+ manual top-level values). Falls back to the
+    whole user_data if extractedFields isn't present, so nothing breaks whether the
+    payload is fat (old clients) or lean (trimmed popup.js).
     """
     if not isinstance(user_data, dict):
         return user_data
@@ -129,7 +140,6 @@ def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
     extracted = user_data.get("extractedFields")
     if isinstance(extracted, dict) and extracted:
         lean = dict(extracted)
-        # Preserve any manually-typed top-level values that aren't the known baggage.
         for k, v in user_data.items():
             if k in ("extractedFields", "formFillInstructions", "processedDocuments", "formId"):
                 continue
@@ -137,19 +147,18 @@ def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
                 lean[k] = v
         return lean
 
-    # No extractedFields wrapper — strip only the known-heavy keys.
     return {
         k: v for k, v in user_data.items()
         if k not in ("formFillInstructions", "processedDocuments")
     }
 
 
-def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
-    groq_api_key = os.environ.get("GROQ_API_KEY", "")
-    if not groq_api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in environment")
+def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
+    api_key = os.environ.get(LLM_API_KEY_ENV, "")
+    if not api_key:
+        raise HTTPException(status_code=500, detail=f"{LLM_API_KEY_ENV} not set in environment")
 
-    # Build the SAME field context Gemini's fieldsForLLM used.
+    # Build the field context the model maps against.
     fields_for_llm = []
     for f in fields:
         fid = f.get("id") or f.get("name")
@@ -170,7 +179,6 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
     if not fields_for_llm:
         return []
 
-    # PAYLOAD TRIM: send the model only the user's real values.
     lean_user_data = _lean_user_data(user_data)
 
     prompt_data = {
@@ -182,13 +190,13 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
 
     try:
         response = requests.post(
-            GROQ_URL,
+            LLM_URL,
             headers={
-                "Authorization": f"Bearer {groq_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type":  "application/json",
             },
             json={
-                "model": GROQ_MODEL,
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user",   "content": user_prompt},
@@ -202,7 +210,7 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
         resp_json = response.json()
 
         if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Groq error: {resp_json}")
+            raise HTTPException(status_code=502, detail=f"LLM error: {resp_json}")
 
         raw = resp_json["choices"][0]["message"]["content"].strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
@@ -222,12 +230,13 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Groq call failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}")
 
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "2.2.0", "model": GROQ_MODEL}
+    return {"status": "FormPilot API running", "version": "3.0.0",
+            "provider": "cerebras", "model": LLM_MODEL}
 
 
 @app.get("/health")
@@ -237,12 +246,14 @@ def health():
 
 @app.get("/debug")
 def debug():
-    key = os.environ.get("GROQ_API_KEY", "NOT SET")
+    key = os.environ.get(LLM_API_KEY_ENV, "NOT SET")
     return {
-        "model": GROQ_MODEL,
+        "provider": "cerebras",
+        "model": LLM_MODEL,
+        "key_env": LLM_API_KEY_ENV,
         "key_set": bool(key and key != "NOT SET"),
         "key_length": len(key),
-        "key_start": key[:10] if key else "empty",
+        "key_start": key[:8] if key else "empty",
     }
 
 
@@ -257,9 +268,9 @@ def fill(req: FillRequest):
     print(f"[SESSION {req.session_id}] User data keys: {list(req.user_data.keys())}")
 
     fields_dict = [f.model_dump() for f in req.fields]
-    raw_mapping = call_groq(fields_dict, req.user_data, req.entry_num)
+    raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num)
 
-    print(f"[SESSION {req.session_id}] Groq mapping ({len(raw_mapping)} fields): "
+    print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
           f"{json.dumps(raw_mapping, indent=2, ensure_ascii=False)}")
 
     type_by_id = {}
