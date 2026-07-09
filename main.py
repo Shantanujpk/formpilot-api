@@ -49,6 +49,10 @@ LLM_URL = "https://api.cerebras.ai/v1/chat/completions"
 # Cerebras uses the same key env var name we set on Railway:
 LLM_API_KEY_ENV = "CEREBRAS_API_KEY"
 
+# Some providers/models reject the response_format param. If set False and the
+# model still returns clean JSON via the prompt, we parse it fine. Toggle if needed.
+USE_JSON_RESPONSE_FORMAT = True
+
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
 SYSTEM_INSTRUCTION = """You are an expert AI form filler that maps a user's REAL data to web form fields, especially Indian government forms.
 
@@ -189,30 +193,39 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
     user_prompt = json.dumps(prompt_data, indent=2, ensure_ascii=False)
 
     try:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.1,
+        }
+        # Some models/providers reject response_format; make it toggleable.
+        if USE_JSON_RESPONSE_FORMAT:
+            payload["response_format"] = {"type": "json_object"}
+
         response = requests.post(
             LLM_URL,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type":  "application/json",
             },
-            json={
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_INSTRUCTION},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            },
+            json=payload,
             timeout=60,
         )
 
         resp_json = response.json()
 
+        # DEBUG: log the FULL raw provider response so we can see exactly what came back.
+        print(f"[LLM RAW STATUS] {response.status_code}")
+        print(f"[LLM RAW RESPONSE] {json.dumps(resp_json, ensure_ascii=False)[:4000]}")
+
         if response.status_code != 200:
             raise HTTPException(status_code=502, detail=f"LLM error: {resp_json}")
 
         raw = resp_json["choices"][0]["message"]["content"].strip()
+        print(f"[LLM MESSAGE CONTENT] {raw[:2000]}")
         raw = raw.replace("```json", "").replace("```", "").strip()
 
         start_arr, end_arr = raw.find("["), raw.rfind("]")
