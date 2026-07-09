@@ -9,7 +9,7 @@ import requests
 import json
 import os
 
-app = FastAPI(title="FormPilot API", version="2.1.0")
+app = FastAPI(title="FormPilot API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,15 +27,16 @@ async def log_raw_requests(request: Request, call_next):
     response = await call_next(request)
     return response
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# ── MODEL SELECTION ──────────────────────────────────────────────────────────
+# One-line toggle. 8B "instant" is the cheapest model and stretches the free-tier
+# TPM the furthest; mapping is an easy task it handles well. If quality drops on
+# tricky dropdowns/transliteration, flip this back to "llama-3.3-70b-versatile".
+GROQ_MODEL = "llama-3.1-8b-instant"
+# GROQ_MODEL = "llama-3.3-70b-versatile"   # <- revert here if 8b isn't sharp enough
+
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
-# The old prompt only said "match/handle" and never said "don't invent", so the
-# model helpfully filled sections with no backing data (e.g. Employment =
-# "Assistant Manager", SSC "Attempts = 1", "Seat/Roll No = 12345"). This version
-# forbids fabrication while still allowing legitimate TRANSFORMS of real data
-# (date reformat, name split, transliteration, dropdown option matching).
 SYSTEM_INSTRUCTION = """You are an expert AI form filler that maps a user's REAL data to web form fields, especially Indian government forms.
 
 ABSOLUTE RULE — NEVER FABRICATE:
@@ -71,8 +72,6 @@ Only include fields you are filling from real userData. Omit everything else.
 Return ONLY the JSON array. No explanation, no markdown, no code fences."""
 
 
-# Field model now carries the SAME context Gemini received.
-# Everything except `id` is optional so loose payloads don't trigger 422s.
 class Field(BaseModel):
     id: Optional[str] = None
     name: Optional[str] = None
@@ -113,6 +112,38 @@ def _normalize_options(options: List[Any]) -> List[Any]:
     return options[:25]
 
 
+def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    PAYLOAD TRIM: the mapper only needs the user's actual values.
+    Incoming user_data often carries baggage the model never uses:
+      - formFillInstructions : stale output from the old popup/Gemini path (wrong form)
+      - processedDocuments   : raw per-document data already merged into extractedFields
+      - formId               : routing id, irrelevant to mapping
+    We send ONLY extractedFields (plus any top-level manual values). Falls back to
+    the whole user_data if extractedFields isn't present, so nothing breaks whether
+    the payload is fat (current) or lean (after popup.js is trimmed).
+    """
+    if not isinstance(user_data, dict):
+        return user_data
+
+    extracted = user_data.get("extractedFields")
+    if isinstance(extracted, dict) and extracted:
+        lean = dict(extracted)
+        # Preserve any manually-typed top-level values that aren't the known baggage.
+        for k, v in user_data.items():
+            if k in ("extractedFields", "formFillInstructions", "processedDocuments", "formId"):
+                continue
+            if k not in lean and isinstance(v, (str, int, float, bool)):
+                lean[k] = v
+        return lean
+
+    # No extractedFields wrapper — strip only the known-heavy keys.
+    return {
+        k: v for k, v in user_data.items()
+        if k not in ("formFillInstructions", "processedDocuments")
+    }
+
+
 def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
     if not groq_api_key:
@@ -139,10 +170,12 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
     if not fields_for_llm:
         return []
 
-    # Mirror Gemini's prompt body: it sent { fields, userData, entryNum } as JSON.
+    # PAYLOAD TRIM: send the model only the user's real values.
+    lean_user_data = _lean_user_data(user_data)
+
     prompt_data = {
         "fields":   fields_for_llm,
-        "userData": user_data,
+        "userData": lean_user_data,
         "entryNum": entry_num,
     }
     user_prompt = json.dumps(prompt_data, indent=2, ensure_ascii=False)
@@ -160,7 +193,7 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user",   "content": user_prompt},
                 ],
-                "temperature": 0.1,                       # matches Gemini's temperature
+                "temperature": 0.1,
                 "response_format": {"type": "json_object"},
             },
             timeout=60,
@@ -174,12 +207,10 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
         raw = resp_json["choices"][0]["message"]["content"].strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
 
-        # json_object mode may wrap the array in an object; handle both.
         start_arr, end_arr = raw.find("["), raw.rfind("]")
         if start_arr != -1 and end_arr != -1:
             return json.loads(raw[start_arr:end_arr + 1])
 
-        # Fallback: parse object and pull the first array value it contains.
         parsed = json.loads(raw)
         if isinstance(parsed, list):
             return parsed
@@ -196,7 +227,7 @@ def call_groq(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = No
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "2.1.0"}
+    return {"status": "FormPilot API running", "version": "2.2.0", "model": GROQ_MODEL}
 
 
 @app.get("/health")
@@ -208,6 +239,7 @@ def health():
 def debug():
     key = os.environ.get("GROQ_API_KEY", "NOT SET")
     return {
+        "model": GROQ_MODEL,
         "key_set": bool(key and key != "NOT SET"),
         "key_length": len(key),
         "key_start": key[:10] if key else "empty",
@@ -230,7 +262,6 @@ def fill(req: FillRequest):
     print(f"[SESSION {req.session_id}] Groq mapping ({len(raw_mapping)} fields): "
           f"{json.dumps(raw_mapping, indent=2, ensure_ascii=False)}")
 
-    # Build a type lookup so we can backfill type the way Gemini did.
     type_by_id = {}
     for f in fields_dict:
         fid = f.get("id") or f.get("name")
