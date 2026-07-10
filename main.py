@@ -170,6 +170,55 @@ def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _extract_mapping_json(raw: str) -> List[Dict]:
+    """
+    Robustly pull the mapping array out of a model response that may contain
+    trailing text, leading reasoning, or an object wrapper. Uses raw_decode so
+    'valid JSON + extra data' no longer throws.
+    """
+    if not raw:
+        return []
+
+    decoder = json.JSONDecoder()
+
+    # Scan for the first position where a JSON value actually starts and decodes.
+    for i, ch in enumerate(raw):
+        if ch not in "[{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(raw[i:])
+        except ValueError:
+            continue  # not a valid JSON value starting here; keep scanning
+
+        # Got one complete JSON value (ignoring anything after it).
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            # array might be wrapped, e.g. {"mapping":[...]} or {"fields":[...]}
+            for v in value.values():
+                if isinstance(v, list):
+                    return v
+            # a single mapping object -> wrap it
+            if "id" in value:
+                return [value]
+        # Not what we want; keep scanning for a later array.
+
+    # Last resort: try a plain load.
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return v
+    except ValueError:
+        pass
+
+    print("[PARSE WARNING] could not extract a JSON array from model output")
+    return []
+
+
 def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
     api_key = os.environ.get(LLM_API_KEY_ENV, "")
     if not api_key:
@@ -241,17 +290,13 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
         print(f"[LLM MESSAGE CONTENT] {raw[:2000]}")
         raw = raw.replace("```json", "").replace("```", "").strip()
 
-        start_arr, end_arr = raw.find("["), raw.rfind("]")
-        if start_arr != -1 and end_arr != -1:
-            return json.loads(raw[start_arr:end_arr + 1])
-
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-        for v in parsed.values():
-            if isinstance(v, list):
-                return v
-        return []
+        # ROBUST PARSE: the model (a reasoning model) sometimes emits the JSON
+        # array followed by extra text, or wraps it in an object, or prepends
+        # reasoning. Naive "first [ to last ]" slicing then fails with
+        # "Extra data". Instead, scan for the first '[' or '{' and use
+        # raw_decode to read exactly one complete JSON value, ignoring anything
+        # trailing.
+        return _extract_mapping_json(raw)
 
     except HTTPException:
         raise
