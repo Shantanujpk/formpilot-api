@@ -10,8 +10,16 @@
 # Bigger than the Llama 3.3 70B we ran on Groq, so it should follow the
 # no-fabricate rule at least as well and fix the 8B hallucination.
 #
-# ENV VAR NEEDED ON RAILWAY:  CEREBRAS_API_KEY
-# (You can leave the old GROQ_API_KEY set too — it's just unused now.)
+# ENV VAR NEEDED (Render / Railway):  CEREBRAS_API_KEY
+#
+# ── THIS REVISION: "hint" SUPPORT ────────────────────────────────────────────
+# scanner.js now captures the helper/instruction line attached to a field, e.g.
+#   "Please enter your name as per 10th or equivalent examination."
+# That sentence often names the SOURCE DOCUMENT a value must come from, which is
+# decisive when the user has several names (Aadhaar vs marksheet). Previously the
+# Field model had no `hint` key, so Pydantic silently DROPPED it and the model
+# never saw it. Three changes: (1) Field.hint, (2) forward it in call_llm,
+# (3) a prompt rule telling the model to honour it.
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +29,7 @@ import requests
 import json
 import os
 
-app = FastAPI(title="FormPilot API", version="3.0.0")
+app = FastAPI(title="FormPilot API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,15 +54,12 @@ LLM_MODEL = "gpt-oss-120b"
 # LLM_MODEL = "gemma-4-31b"          # <- smaller free fallback
 
 LLM_URL = "https://api.cerebras.ai/v1/chat/completions"
-# Cerebras uses the same key env var name we set on Railway:
 LLM_API_KEY_ENV = "CEREBRAS_API_KEY"
 
 # Some providers/models reject or misinterpret the response_format param.
 # Cerebras gpt-oss-120b returns a JSON-SCHEMA fragment ({"type":"object"}) when
 # response_format is set, instead of our data. So we DISABLE it and rely on the
-# prompt (which already says "return ONLY a JSON array"). Cerebras also supports
-# passing a strict schema via response_format, but prompt-driven JSON is simpler
-# and works here.
+# prompt (which already says "return ONLY a JSON array").
 USE_JSON_RESPONSE_FORMAT = False
 
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
@@ -96,6 +101,14 @@ Judge by MEANING, not by matching key names to field names. The userData key and
 - For a dropdown/radio, the value MUST be one of that field's provided options; if no option reasonably matches the user's value, omit the field.
 - Cascading fields: you may only receive a parent field now (e.g. a top-level region); its dependent children appear in LATER requests after the parent is set. Map only fields present in the CURRENT request; never pre-map a field you were not given.
 
+════════ THE "hint" FIELD — READ IT AND OBEY IT ════════
+A field may carry a "hint": the page's own helper/instruction text for that field (plus "label" and "previousHeading" for context). The hint is an INSTRUCTION FROM THE FORM ITSELF and outranks your default choice of value.
+
+- A hint often states WHICH DOCUMENT the value must come from — e.g. "enter your name as per 10th marksheet", "as printed on your PAN card", "as per Aadhaar". When it does, use the value that came from THAT document, even if userData holds a different value of the same kind (a person's name on their Aadhaar and on their marksheet routinely differ in order or spelling — they are not interchangeable).
+- A hint may also state a FORMAT or CONSTRAINT ("in capital letters", "DD/MM/YYYY", "as per SSC certificate"). Honour it.
+- If the hint demands a source or form of the value that userData does NOT contain, OMIT the field. Do NOT substitute a value from a different document or a differently-shaped value — a blank field is correct; a value from the wrong source is a critical failure.
+- If a field has no hint, fall back to the normal rules above.
+
 ════════ OUTPUT ════════
 Return ONLY a raw JSON array — start with [ and end with ]. No reasoning, no explanation, no markdown, no code fences, no schema object.
 Each element: {"id": "<exact field id>", "value": "<derived value>", "action": "type|select|check|radio|search_and_select", "source": "<comma-separated userData key(s) this value derives from>"}
@@ -113,6 +126,7 @@ class Field(BaseModel):
     pattern: Optional[str] = None
     ariaLabel: Optional[str] = None
     previousHeading: Optional[str] = None
+    hint: Optional[str] = ""         # NEW: page helper text, e.g. "name as per 10th marksheet"
     tag: Optional[str] = "INPUT"
 
 
@@ -162,12 +176,35 @@ def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             if k not in lean and isinstance(v, (str, int, float, bool)):
                 lean[k] = v
-        return lean
+        return _clean_keys(lean)
 
-    return {
+    return _clean_keys({
         k: v for k, v in user_data.items()
         if k not in ("formFillInstructions", "processedDocuments")
-    }
+    })
+
+
+def _clean_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    KEY HYGIENE: extraction sometimes emits malformed keys — trailing spaces
+    ("nationality "), mixed case and spaces ("Year of Passing"). The LLM tolerates
+    these, but any deterministic matcher (e.g. localFillSelects in content.js) would
+    miss them. Normalise to trimmed, lowercase, space-free keys. First key wins on
+    a collision, so nothing is silently overwritten.
+    """
+    if not isinstance(data, dict):
+        return data
+    cleaned: Dict[str, Any] = {}
+    for k, v in data.items():
+        if not isinstance(k, str):
+            cleaned[k] = v
+            continue
+        nk = k.strip().lower().replace(" ", "")
+        if nk and nk not in cleaned:
+            cleaned[nk] = v
+        elif nk not in cleaned:
+            cleaned[k] = v
+    return cleaned
 
 
 def _extract_mapping_json(raw: str) -> List[Dict]:
@@ -240,6 +277,7 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
             "pattern":         f.get("pattern"),
             "ariaLabel":       f.get("ariaLabel"),
             "previousHeading": f.get("previousHeading"),
+            "hint":            f.get("hint", "") or "",   # NEW: the form's own instruction
         })
 
     if not fields_for_llm:
@@ -306,8 +344,8 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "3.0.0",
-            "provider": "cerebras", "model": LLM_MODEL}
+    return {"status": "FormPilot API running", "version": "3.1.0",
+            "provider": "cerebras", "model": LLM_MODEL, "hint_support": True}
 
 
 @app.get("/health")
@@ -339,6 +377,16 @@ def fill(req: FillRequest):
     print(f"[SESSION {req.session_id}] User data keys: {list(req.user_data.keys())}")
 
     fields_dict = [f.model_dump() for f in req.fields]
+
+    # QA VISIBILITY: confirm the scanner's context is actually arriving. If
+    # labelled/hinted are 0, the scanner fix isn't loaded in the browser.
+    labelled = sum(1 for f in fields_dict if f.get("label"))
+    hinted = sum(1 for f in fields_dict if f.get("hint"))
+    print(f"[SESSION {req.session_id}] Context: {labelled}/{len(fields_dict)} labelled, {hinted} hinted")
+    for f in fields_dict:
+        if f.get("hint"):
+            print(f"[SESSION {req.session_id}]   HINT {f.get('id')}: {f.get('hint')}")
+
     raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num)
 
     print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
