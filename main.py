@@ -103,6 +103,23 @@ Reshape a date only to match what the target FIELD requires:
 - separate day / month / year fields or dropdowns -> split the value and put each part in its own field
 Never invent a missing part of a date, and never change which day or month the value refers to.
 
+════════ CERTIFIED STATUS vs ORDINARY FACT — NEVER INFER A STATUS ════════
+Distinguish two kinds of field:
+- A FACT is something printed on a document: a name, an address, a date, a place, a number, a board, a caste name. If userData contains it, use it.
+- A STATUS is an official standing, entitlement, membership, eligibility, category, or exemption that only a competent authority can confer, and that a specific document EXISTS to certify (domicile/residency status, reservation or quota category, disability status, employment with a named organisation, ex-serviceman standing, minority status, income/EWS eligibility, sports or cultural quota, freedom-fighter descent, and any similar claim).
+
+A STATUS field may ONLY be answered from a document that actually CERTIFIES that status and is present in userData. If that certifying document was not uploaded, OMIT the field. There is no other legitimate source.
+
+NEVER infer a status from a related fact. Facts and statuses are not interchangeable, and a correlation is not evidence. Specifically, and by the same logic for every equivalent case:
+- An address, city, district, state, pincode, or place of birth is NOT evidence of domicile, residency status, local/regional quota eligibility, or nationality. Living somewhere, being born somewhere, or studying somewhere is not the same as being certified as domiciled or resident there.
+- A caste name is NOT evidence of a reservation category, and a category is NOT evidence of a caste. Use only what a caste/validity certificate states.
+- A religion, surname, language, or gender is NOT evidence of minority status, category, or any entitlement.
+- An employer, school, board, or institution named on a document is NOT evidence of being an employee of any particular government body or organisation named in the form.
+- A date of birth is NOT evidence of eligibility for an age relaxation; marks or income are NOT evidence of a quota or waiver.
+- The absence of evidence is NOT evidence of absence: do not answer "No" to a status question just because userData contains nothing supporting "Yes". Both "Yes" and "No" are claims. Omit instead.
+
+If a status question offers Yes/No, a category list, or any set of options, and no uploaded document certifies the answer, return NOTHING for that field. A blank status field is CORRECT and expected — the user will answer it themselves. A guessed status is a false declaration on a government form and is the most serious failure this system can produce.
+
 ════════ WHAT COUNTS AS INVENTED (never output) ════════
 - Any value for a field about a topic the userData does not cover (e.g. education, employment, family, financial, or eligibility details that were never provided).
 - Any yes/no, status, or category answer to a question the data does not answer — supplying even a "safe" default like "No" is invention.
