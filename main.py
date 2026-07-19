@@ -593,10 +593,17 @@ def build_provenance(data: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         entries.sort(key=rank, reverse=True)
-        prov[canon] = {
-            "doc": entries[0]["source"],
-            "by_value": {str(e["value"]).strip().lower(): e["source"] for e in entries},
-        }
+        # Build the value->document index in PRIORITY ORDER, keeping the FIRST
+        # (highest-priority) document for a given value. Two documents often carry
+        # an identical value (both Aadhaar and the birth certificate say "FEMALE");
+        # without this the lower-priority one overwrote the winner and the panel
+        # credited the wrong document.
+        by_value: Dict[str, str] = {}
+        for e in entries:
+            vk = str(e["value"]).strip().lower()
+            if vk and vk not in by_value:
+                by_value[vk] = e["source"]
+        prov[canon] = {"doc": entries[0]["source"], "by_value": by_value}
     return prov
 
 
