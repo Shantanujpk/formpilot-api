@@ -40,7 +40,7 @@ import json
 import os
 import re
 
-app = FastAPI(title="FormPilot API", version="3.2.0")
+app = FastAPI(title="FormPilot API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -140,6 +140,16 @@ A field may carry a "hint": the page's own helper/instruction text for that fiel
 - A hint may also state a FORMAT or CONSTRAINT ("in capital letters", "DD/MM/YYYY", "as per SSC certificate"). Honour it.
 - If the hint demands a source or form of the value that userData does NOT contain, OMIT the field. Do NOT substitute a value from a different document or a differently-shaped value — a blank field is correct; a value from the wrong source is a critical failure.
 - If a field has no hint, fall back to the normal rules above.
+
+════════ VALUES WITH VARIANTS — CHOOSING THE RIGHT SOURCE ════════
+Most userData values are plain strings. But when several uploaded documents state the same fact differently, that value arrives as an object instead:
+  "name": {"value": "Snehal Sanjay Bhise", "source": "aadhaar",
+           "variants": [{"value": "Bhise Snehal Sanjay", "source": "10th_marksheet"}]}
+- "value" is the DEFAULT, already chosen by document authority. Use it whenever the field does not ask for a specific source.
+- "variants" are the SAME fact as printed on OTHER documents. Use one ONLY when the field's hint, label or heading names that document (e.g. "as per 10th marksheet" -> the variant whose source is 10th_marksheet). Match the document, not the wording.
+- If a field names a document and NO variant has that source, OMIT the field. Never substitute the default or another document's value — a name printed on the wrong certificate is a wrong answer, not a near-enough one.
+- Never blend variants together, and never output the object itself: always output a single plain string value.
+- In "source", record the userData key you used (e.g. "name"), and add the document when you picked a variant (e.g. "name (10th_marksheet)").
 
 ════════ OUTPUT ════════
 Return ONLY a raw JSON array — start with [ and end with ]. No reasoning, no explanation, no markdown, no code fences, no schema object.
@@ -322,6 +332,273 @@ def _normalize_dates(data: Dict[str, Any], session_id: str = "") -> Dict[str, An
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MERGE / CANONICAL KEYS  (deterministic — no LLM involved)
+# ═════════════════════════════════════════════════════════════════════════════
+#  WHY: extraction now returns document-prefixed keys (aadhaar_fullname,
+#  pan_fullname, birth_certificate_fullname, 12th_marksheet_fullname...). That
+#  removed silent collisions, but left a NEW problem: with four different names
+#  in the payload, nothing decides which one a plainly-labelled "Full Name" field
+#  should get. Two identical test runs produced DIFFERENT answers (mother's name
+#  came from the birth certificate in one run and the 12th marksheet in the next).
+#
+#  This module makes that deterministic:
+#    1. group the prefixed keys by CANONICAL field  (aadhaar_fullname -> name)
+#    2. a per-key PRIORITY table picks the DEFAULT  (Aadhaar wins "name",
+#       the birth certificate wins "dob" as the original source, and so on)
+#    3. the losers are NOT discarded — they survive as `variants` carrying their
+#       `source`, so a field hinted "name as per 12th marksheet" still resolves
+#    4. ties break on completeness, then a fixed document order, so the same
+#       input always produces the same output
+#
+#  TWO SUBTLETIES THAT MATTER:
+#    * A "district" on a BIRTH certificate is the district of BIRTH, not of
+#      residence. Merging them would be wrong — and it already caused a real bug
+#      (birth-certificate taluka "Haveli" leaked into the permanent address).
+#      Birth-certificate place fields therefore map to birth_* canonicals.
+#    * A 10th percentage and a 12th percentage are DIFFERENT facts and a form asks
+#      for both. Education documents keep their qualification level on those keys
+#      (12th_percentage, 10th_board), while their PERSON facts (name, dob, parents)
+#      merge normally.
+#
+#  Set MERGE_ENABLED=false in the environment to switch all of this off and fall
+#  back to the previous flat behaviour.
+
+MERGE_ENABLED = os.environ.get("MERGE_ENABLED", "true").lower() != "false"
+
+DOCUMENT_PREFIXES = sorted([
+    "10th_leavingcertificate", "12th_leavingcertificate",
+    "10th_certificate", "10th_marksheet", "12th_marksheet",
+    "nationality_certificate", "transfer_certificate",
+    "caste_certificate", "caste_validity", "birth_certificate",
+    "parent_voterid", "aadhaar", "pan",
+], key=len, reverse=True)
+
+# raw field-part -> canonical name (applies to every document)
+FIELD_ALIASES = {
+    "fullname": "name", "firstname": "first_name", "middlename": "middle_name",
+    "lastname": "last_name", "fathername": "father_name",
+    "mothername": "mother_name", "dateofbirth": "dob",
+    "yearofbirth": "year_of_birth", "placeofbirth": "place_of_birth",
+    "fulladdress": "address", "housenumber": "house_number",
+    "aadhaarnumber": "aadhaar_number", "number": "aadhaar_number",
+    "pannumber": "pan_number", "epic_number": "voter_id_number",
+}
+
+# Per-document overrides, for fields whose MEANING depends on the document.
+DOC_FIELD_ALIASES = {
+    "birth_certificate": {          # these are places of BIRTH, not of residence
+        "village": "birth_village", "taluka": "birth_taluka",
+        "district": "birth_district", "state": "birth_state",
+        "pincode": "birth_pincode", "country": "birth_country",
+    },
+    "caste_certificate": {          # the ISSUING office's location
+        "issue_taluka": "certificate_issue_taluka",
+        "issue_district": "certificate_issue_district",
+        "issue_state": "certificate_issue_state",
+    },
+    "nationality_certificate": {
+        "birth_place": "place_of_birth", "birth_taluka": "birth_taluka",
+        "birth_district": "birth_district",
+        "residence_taluka": "taluka", "residence_district": "district",
+        "domicile_state": "domicile_state",
+    },
+    "12th_leavingcertificate": {
+        "school_name": "12th_school_name", "school_district": "12th_school_district",
+        "school_state": "12th_school_state", "school_pincode": "12th_school_pincode",
+    },
+    "10th_leavingcertificate": {
+        "school_name": "10th_school_name", "school_district": "10th_school_district",
+        "school_state": "10th_school_state", "school_pincode": "10th_school_pincode",
+    },
+}
+
+# Education documents carry BOTH person facts and qualification facts.
+# Person facts merge across documents; qualification facts stay per level.
+EDUCATION_LEVEL = {
+    "10th_certificate": "10th", "10th_marksheet": "10th",
+    "10th_leavingcertificate": "10th",
+    "12th_marksheet": "12th", "12th_leavingcertificate": "12th",
+}
+PERSON_FIELDS = {
+    "name", "first_name", "middle_name", "last_name", "father_name",
+    "mother_name", "dob", "year_of_birth", "place_of_birth", "gender",
+    "caste", "religion", "category", "nationality", "mother_tongue",
+    "address", "house_number", "locality", "city", "district", "taluka",
+    "state", "pincode", "country",
+}
+
+DEFAULT_PRIORITY = 10
+
+# WHICH DOCUMENT WINS EACH CANONICAL KEY.
+# Rule used: the document that ISSUES/CERTIFIES a fact outranks documents that
+# merely reprint it. Where no single document issues it (a name, an address),
+# the winner is whatever a verifier checks against — in India, Aadhaar.
+PRIORITY = {
+    "name": {"aadhaar": 100, "pan": 80, "birth_certificate": 70,
+             "nationality_certificate": 65, "caste_validity": 62,
+             "caste_certificate": 60, "transfer_certificate": 55,
+             "12th_leavingcertificate": 50, "10th_leavingcertificate": 48,
+             "12th_marksheet": 45, "10th_marksheet": 43,
+             "10th_certificate": 40, "parent_voterid": 35},
+    # the birth certificate is the ORIGINAL source of a date of birth;
+    # Aadhaar's is a copy (and is sometimes only a year)
+    "dob": {"birth_certificate": 100, "aadhaar": 90, "pan": 80,
+            "nationality_certificate": 70, "transfer_certificate": 60,
+            "12th_leavingcertificate": 55, "10th_leavingcertificate": 53,
+            "12th_marksheet": 50, "10th_marksheet": 48,
+            "10th_certificate": 45, "parent_voterid": 30},
+    "father_name": {"aadhaar": 100, "pan": 90, "birth_certificate": 85,
+                    "caste_certificate": 70, "transfer_certificate": 65,
+                    "12th_leavingcertificate": 55, "10th_leavingcertificate": 53,
+                    "12th_marksheet": 50, "10th_marksheet": 48,
+                    "10th_certificate": 45},
+    "mother_name": {"birth_certificate": 100, "transfer_certificate": 80,
+                    "12th_leavingcertificate": 70, "10th_leavingcertificate": 68,
+                    "12th_marksheet": 60, "10th_marksheet": 58,
+                    "10th_certificate": 55},
+    "gender": {"aadhaar": 100, "birth_certificate": 80, "parent_voterid": 60},
+    # the validity certificate exists to confirm the caste claim is genuine
+    "caste": {"caste_validity": 100, "caste_certificate": 90,
+              "transfer_certificate": 60, "12th_leavingcertificate": 55,
+              "10th_leavingcertificate": 53},
+    "category": {"caste_validity": 100, "caste_certificate": 90},
+    "religion": {"caste_certificate": 90, "transfer_certificate": 80,
+                 "12th_leavingcertificate": 70, "10th_leavingcertificate": 68},
+    "nationality": {"nationality_certificate": 100, "aadhaar": 80,
+                    "transfer_certificate": 60},
+    "place_of_birth": {"birth_certificate": 100, "nationality_certificate": 85,
+                       "transfer_certificate": 60, "12th_leavingcertificate": 55,
+                       "10th_leavingcertificate": 53},
+}
+for _k in ("address", "house_number", "locality", "city", "district",
+           "taluka", "state", "pincode", "country"):
+    # residence details: Aadhaar is the address a verifier checks
+    PRIORITY[_k] = {"aadhaar": 100, "parent_voterid": 60,
+                    "nationality_certificate": 40}
+
+# Deterministic final tiebreak, so an unranked tie can never depend on dict order.
+DOC_ORDER = ["aadhaar", "pan", "birth_certificate", "nationality_certificate",
+             "caste_validity", "caste_certificate", "transfer_certificate",
+             "12th_leavingcertificate", "10th_leavingcertificate",
+             "12th_marksheet", "10th_marksheet", "10th_certificate",
+             "parent_voterid"]
+
+
+def _split_document_key(key: str):
+    """'aadhaar_fullname' -> ('aadhaar', 'fullname'). (None, key) if unprefixed."""
+    for p in DOCUMENT_PREFIXES:
+        if key.startswith(p + "_"):
+            return p, key[len(p) + 1:]
+    return None, key
+
+
+def _canonical_for(doc: str, field_part: str) -> str:
+    over = DOC_FIELD_ALIASES.get(doc, {})
+    if field_part in over:
+        return over[field_part]
+    canon = FIELD_ALIASES.get(field_part, field_part)
+    lvl = EDUCATION_LEVEL.get(doc)
+    if lvl and canon not in PERSON_FIELDS:
+        canon = f"{lvl}_{canon}"
+    return canon
+
+
+def _completeness(v) -> int:
+    """Tiebreak helper: a full DD/MM/YYYY beats a bare year; longer beats truncated."""
+    s = str(v).strip()
+    if re.match(r"^\d{2}/\d{2}/\d{4}$", s):
+        return 1000
+    return len(s)
+
+
+def _normalize_years(data: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
+    """
+    Expand 2-digit years to 4 digits. Extraction returned "23" for a passing year
+    in one run and "2023" in the next; a Year dropdown lists "2023", so the short
+    form fails to match. Deterministic, same reasoning as the date normaliser.
+    """
+    if not isinstance(data, dict):
+        return data
+    out = {}
+    for k, v in data.items():
+        kl = str(k).lower()
+        is_year_key = kl.endswith("_year") or "passingyear" in kl or "yearofbirth" in kl
+        if is_year_key and isinstance(v, (str, int)):
+            s = str(v).strip()
+            if re.fullmatch(r"\d{2}", s):
+                n = int(s)
+                fixed = str(2000 + n if n <= 30 else 1900 + n)
+                print(f"[SESSION {session_id}] YEAR NORMALISED {k}: {s!r} -> {fixed!r}")
+                out[k] = fixed
+                continue
+        out[k] = v
+    return out
+
+
+def merge_user_data(data: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
+    """
+    Collapse document-prefixed keys into canonical keys with a deterministic
+    default plus sourced variants. Unprefixed keys pass through untouched, so a
+    document type we do not know about still reaches the mapper.
+    """
+    if not isinstance(data, dict) or not MERGE_ENABLED:
+        return data
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    merged: Dict[str, Any] = {}
+    docs_seen = set()
+
+    for k, v in data.items():
+        if v is None or str(v).strip() == "":
+            continue
+        doc, field_part = _split_document_key(k)
+        if doc is None:
+            merged[k] = v                      # unknown/manual key -> pass through
+            continue
+        docs_seen.add(doc)
+        canon = _canonical_for(doc, field_part)
+        groups.setdefault(canon, []).append({"value": v, "source": doc})
+
+    contested = 0
+    for canon, entries in groups.items():
+        table = PRIORITY.get(canon, {})
+
+        def rank(e):
+            return (
+                table.get(e["source"], DEFAULT_PRIORITY),
+                _completeness(e["value"]),
+                -(DOC_ORDER.index(e["source"]) if e["source"] in DOC_ORDER else 99),
+            )
+
+        entries.sort(key=rank, reverse=True)
+        winner = entries[0]
+
+        alts = []
+        seen = {str(winner["value"]).strip().lower()}
+        for e in entries[1:]:
+            sv = str(e["value"]).strip().lower()
+            if sv in seen:
+                continue
+            seen.add(sv)
+            alts.append({"value": e["value"], "source": e["source"]})
+
+        if not alts:
+            merged[canon] = winner["value"]
+        else:
+            contested += 1
+            merged[canon] = {
+                "value": winner["value"],
+                "source": winner["source"],
+                "variants": alts,
+            }
+
+    print(f"[SESSION {session_id}] MERGE: {len(data)} keys -> {len(merged)} canonical "
+          f"({contested} contested) from documents {sorted(docs_seen)}")
+    return merged
+
+
 def _normalize_options(options: List[Any]) -> List[Any]:
     """Keep option objects intact but cap them for token safety."""
     return options[:25]
@@ -373,13 +650,22 @@ def _lean_user_data(user_data: Dict[str, Any], session_id: str = "") -> Dict[str
                 continue
             if k not in lean and isinstance(v, (str, int, float, bool)):
                 lean[k] = v
-        return _normalize_dates(_clean_keys(lean), session_id)
+        return merge_user_data(
+            _normalize_years(_normalize_dates(_clean_keys(lean), session_id), session_id),
+            session_id,
+        )
 
-    return _normalize_dates(
-        _clean_keys({
-            k: v for k, v in user_data.items()
-            if k not in ("formFillInstructions", "processedDocuments")
-        }),
+    return merge_user_data(
+        _normalize_years(
+            _normalize_dates(
+                _clean_keys({
+                    k: v for k, v in user_data.items()
+                    if k not in ("formFillInstructions", "processedDocuments")
+                }),
+                session_id,
+            ),
+            session_id,
+        ),
         session_id,
     )
 
@@ -507,9 +793,9 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "3.2.0",
+    return {"status": "FormPilot API running", "version": "3.3.0",
             "provider": "cerebras", "model": LLM_MODEL,
-            "hint_support": True, "date_normalisation": True}
+            "hint_support": True, "date_normalisation": True, "merge": MERGE_ENABLED}
 
 
 @app.get("/health")
