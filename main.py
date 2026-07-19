@@ -198,6 +198,9 @@ class MappedField(BaseModel):
     # extension could never show the user why a field was filled. Now passed
     # through for the "See Mapping" panel.
     source: Optional[str] = ""
+    # WHICH UPLOADED DOCUMENT the value came from, resolved server-side from the
+    # merge grouping (the model only ever cites a canonical key).
+    source_document: Optional[str] = ""
 
 
 class FillResponse(BaseModel):
@@ -551,6 +554,97 @@ def _normalize_years(data: Dict[str, Any], session_id: str = "") -> Dict[str, An
     return out
 
 
+def build_provenance(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Which DOCUMENT supplied each canonical key.
+
+    merge_user_data() already works this out in order to pick a default, then
+    discards it — so the mapper could only ever cite a canonical key ("address"),
+    never the document behind it ("aadhaar"). This recomputes the same grouping and
+    keeps the answer, so every filled field can be shown to the user as
+    "Address Line 2  <-  Aadhaar" instead of a bare key.
+
+    Returns {canonical: {"doc": <winning document>,
+                         "by_value": {lowercased value: document}}}
+    so that when the model picks a VARIANT we can identify the real source by
+    matching the value it actually used.
+    """
+    prov: Dict[str, Any] = {}
+    if not isinstance(data, dict):
+        return prov
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for k, v in data.items():
+        if v is None or str(v).strip() == "":
+            continue
+        doc, field_part = _split_document_key(k)
+        if doc is None:
+            continue
+        groups.setdefault(_canonical_for(doc, field_part), []).append(
+            {"value": v, "source": doc}
+        )
+    for canon, entries in groups.items():
+        table = PRIORITY.get(canon, {})
+
+        def rank(e):
+            return (
+                table.get(e["source"], DEFAULT_PRIORITY),
+                _completeness(e["value"]),
+                -(DOC_ORDER.index(e["source"]) if e["source"] in DOC_ORDER else 99),
+            )
+
+        entries.sort(key=rank, reverse=True)
+        prov[canon] = {
+            "doc": entries[0]["source"],
+            "by_value": {str(e["value"]).strip().lower(): e["source"] for e in entries},
+        }
+    return prov
+
+
+DOC_LABELS = {
+    "aadhaar": "Aadhaar", "pan": "PAN card",
+    "birth_certificate": "Birth certificate",
+    "caste_certificate": "Caste certificate",
+    "caste_validity": "Caste validity certificate",
+    "nationality_certificate": "Nationality / domicile certificate",
+    "transfer_certificate": "Transfer certificate",
+    "parent_voterid": "Voter ID",
+    "10th_marksheet": "10th marksheet", "12th_marksheet": "12th marksheet",
+    "10th_certificate": "10th certificate",
+    "10th_leavingcertificate": "10th leaving certificate",
+    "12th_leavingcertificate": "12th leaving certificate",
+}
+
+
+def resolve_source_document(source: str, value: str, prov: Dict[str, Any]) -> str:
+    """
+    Given the canonical key(s) the model cited and the value it produced, work out
+    which uploaded document that value came from. When the model used a VARIANT, the
+    value match finds the right document rather than the default one.
+    """
+    if not source or not prov:
+        return ""
+    docs = []
+    val = str(value).strip().lower()
+    for raw in str(source).replace("(", ",").replace(")", ",").split(","):
+        key = raw.strip()
+        if not key:
+            continue
+        if key in DOC_LABELS and key not in docs:      # model named the document itself
+            docs.append(key)
+            continue
+        info = prov.get(key)
+        if not info:
+            continue
+        doc = info["doc"]
+        for v, d in info["by_value"].items():          # exact value match wins
+            if v and (v == val or v in val or val in v):
+                doc = d
+                break
+        if doc not in docs:
+            docs.append(doc)
+    return ", ".join(DOC_LABELS.get(d, d) for d in docs)
+
+
 def merge_user_data(data: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
     """
     Collapse document-prefixed keys into canonical keys with a deterministic
@@ -863,6 +957,16 @@ def fill(req: FillRequest):
 
     raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num, req.session_id)
 
+    # PROVENANCE: attach the source DOCUMENT to each mapped field, for the
+    # extension's "See Mapping" panel.
+    prov = {}
+    try:
+        _src = req.user_data.get("extractedFields") if isinstance(req.user_data, dict) else None
+        _base = _src if isinstance(_src, dict) and _src else req.user_data
+        prov = build_provenance(_clean_keys(_base))
+    except Exception as e:
+        print(f"[SESSION {req.session_id}] provenance build failed: {e}")
+
     print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
           f"{json.dumps(raw_mapping, indent=2, ensure_ascii=False)}")
 
@@ -884,6 +988,9 @@ def fill(req: FillRequest):
             type   = field_type,
             action = action,
             source = str(m.get("source") or ""),
+            source_document = resolve_source_document(
+                str(m.get("source") or ""), str(m["value"]), prov
+            ),
         ))
 
     return FillResponse(
