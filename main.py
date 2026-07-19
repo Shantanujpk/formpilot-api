@@ -151,6 +151,15 @@ Most userData values are plain strings. But when several uploaded documents stat
 - Never blend variants together, and never output the object itself: always output a single plain string value.
 - In "source", record the userData key you used (e.g. "name"), and add the document when you picked a variant (e.g. "name (10th_marksheet)").
 
+════════ PLACE KEYS ARE NOT INTERCHANGEABLE ════════
+Several kinds of place appear in userData and they mean DIFFERENT things. Match a field to the right kind; never borrow from another kind just because it is the only place value available.
+- RESIDENCE (where the person lives): address, house_number, locality, city, district, taluka, state, pincode, country. ONLY these may fill a residential, permanent, present, correspondence, or communication address field.
+- BIRTH (where the person was born): place_of_birth, birth_village, birth_taluka, birth_district, birth_state, birth_pincode. Use these ONLY for a field that asks about place/district/state OF BIRTH. A person is very often born somewhere they do not live.
+- INSTITUTION (where a school or college is): 10th_school_*, 12th_school_*, and similar. Use these ONLY for school/college address fields.
+- ISSUING OFFICE (where a certificate was issued): certificate_issue_taluka, certificate_issue_district, certificate_issue_state, and any issue_* key. Use these ONLY for a field asking where the certificate was issued.
+
+If an address field has no value of the MATCHING kind, OMIT it. Leaving a taluka blank is correct; filling it with the taluka of birth, of a school, or of an issuing office is a wrong answer. The same applies in reverse: never fill a place-of-birth field from the residential address.
+
 ════════ OUTPUT ════════
 Return ONLY a raw JSON array — start with [ and end with ]. No reasoning, no explanation, no markdown, no code fences, no schema object.
 Each element: {"id": "<exact field id>", "value": "<derived value>", "action": "type|select|check|radio|search_and_select", "source": "<comma-separated userData key(s) this value derives from>"}
@@ -184,6 +193,11 @@ class MappedField(BaseModel):
     value: str
     type: str
     action: str
+    # PROVENANCE: which userData key(s) this value came from, echoed back from the
+    # model. Previously computed by the model and then DROPPED here, so the
+    # extension could never show the user why a field was filled. Now passed
+    # through for the "See Mapping" panel.
+    source: Optional[str] = ""
 
 
 class FillResponse(BaseModel):
@@ -795,7 +809,7 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
 def root():
     return {"status": "FormPilot API running", "version": "3.3.0",
             "provider": "cerebras", "model": LLM_MODEL,
-            "hint_support": True, "date_normalisation": True, "merge": MERGE_ENABLED}
+            "hint_support": True, "date_normalisation": True, "merge": MERGE_ENABLED, "provenance": True}
 
 
 @app.get("/health")
@@ -869,6 +883,7 @@ def fill(req: FillRequest):
             value  = str(m["value"]),
             type   = field_type,
             action = action,
+            source = str(m.get("source") or ""),
         ))
 
     return FillResponse(
