@@ -7,19 +7,29 @@
 # AND ~1M/day, 30K TPM, 65,536 context on gpt-oss-120b — far more headroom.
 #
 # MODEL: gpt-oss-120b (OpenAI's open 120B model, "Production" on Cerebras).
-# Bigger than the Llama 3.3 70B we ran on Groq, so it should follow the
-# no-fabricate rule at least as well and fix the 8B hallucination.
 #
 # ENV VAR NEEDED (Render / Railway):  CEREBRAS_API_KEY
 #
-# ── THIS REVISION: "hint" SUPPORT ────────────────────────────────────────────
-# scanner.js now captures the helper/instruction line attached to a field, e.g.
-#   "Please enter your name as per 10th or equivalent examination."
-# That sentence often names the SOURCE DOCUMENT a value must come from, which is
-# decisive when the user has several names (Aadhaar vs marksheet). Previously the
-# Field model had no `hint` key, so Pydantic silently DROPPED it and the model
-# never saw it. Three changes: (1) Field.hint, (2) forward it in call_llm,
-# (3) a prompt rule telling the model to honour it.
+# ── THIS REVISION (3.2.0): DETERMINISTIC DATE NORMALISATION ──────────────────
+# Extraction testing showed date-format drift across five documents:
+#     "30 SEP 2014"  "21-June-2005"  "16-01-2017"  "14.06.2016"
+#     "16th day of April in the year 1998"
+# Root cause: the extraction prompts said "return exactly as printed, in
+# DD/MM/YYYY format" — a CONTRADICTION when the printed date isn't numeric, and
+# the model resolved it as "as printed". Asking a model to reformat is the wrong
+# tool: it works ~90% of the time, which is the hardest failure mode to catch.
+#
+# FIX: date conversion is a pure mechanical transform, so it belongs in CODE.
+# _normalize_dates() runs over user_data at ingest and rewrites every date-ish
+# value to canonical DD/MM/YYYY before the mapper ever sees it. The extraction
+# prompt can now simply say "return the date as printed" — the model READS, the
+# code CONVERTS. Same hybrid principle that fixed the cascade bug: deterministic
+# work in code, judgement in the LLM.
+#
+# NOTE: this is LAYER 1 (canonical storage). LAYER 2 is field-aware formatting at
+# fill time in content.js — reshaping DD/MM/YYYY into whatever the target field
+# wants (text DD/MM/YYYY, ISO YYYY-MM-DD for <input type="date">, or split across
+# day/month/year dropdowns). A single canonical form makes layer 2 trivial.
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,8 +38,9 @@ from typing import Any, List, Optional, Dict
 import requests
 import json
 import os
+import re
 
-app = FastAPI(title="FormPilot API", version="3.1.0")
+app = FastAPI(title="FormPilot API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,18 +59,14 @@ async def log_raw_requests(request: Request, call_next):
     return response
 
 # ── PROVIDER / MODEL SELECTION (Cerebras, OpenAI-compatible) ─────────────────
-# One-line toggle. gpt-oss-120b is the biggest + Production-grade free model.
-# If its mapping style doesn't suit your forms, try "gemma-4-31b" (also free).
 LLM_MODEL = "gpt-oss-120b"
 # LLM_MODEL = "gemma-4-31b"          # <- smaller free fallback
 
 LLM_URL = "https://api.cerebras.ai/v1/chat/completions"
 LLM_API_KEY_ENV = "CEREBRAS_API_KEY"
 
-# Some providers/models reject or misinterpret the response_format param.
-# Cerebras gpt-oss-120b returns a JSON-SCHEMA fragment ({"type":"object"}) when
-# response_format is set, instead of our data. So we DISABLE it and rely on the
-# prompt (which already says "return ONLY a JSON array").
+# Cerebras gpt-oss-120b returns a JSON-SCHEMA fragment when response_format is
+# set, instead of our data. Disabled; we rely on the prompt.
 USE_JSON_RESPONSE_FORMAT = False
 
 # ── SYSTEM INSTRUCTION — HARDENED against fabrication (Tier-1 / Tier-2 fix) ───
@@ -87,6 +94,14 @@ Judge by MEANING, not by matching key names to field names. The userData key and
 - ONE VALUE CAN FILL SEVERAL FIELDS: a single real-world entity can be the correct answer for more than one differently-named field. If the data provides only one place name and the form asks for several administrative levels (e.g. both District and Village/City, or both Taluka and District) with no finer value to separate them, use that same place name for each field it correctly answers rather than filling one and leaving the rest blank. Do not "use up" a value on a single field. This reuse is DERIVATION (the value traces to real data), not invention.
 - Only omit an address-level field when the combined value genuinely contains nothing that fits it.
 - DROPDOWN ADMIN-LEVEL MATCHING (applies even when the dropdown arrives alone): when a select field represents an administrative level (district, taluka, tehsil, sub-district, division, block) and ANY value in userData (especially "city", "state", "locality", or a segment of "fulladdress") EXACTLY matches one of the field's provided options, select that option. Indian district dropdowns commonly list the city name as a district (e.g. userData city "Pune" -> district option "Pune"; "Nagpur", "Mumbai" likewise). Do not skip the field just because there is no userData key literally named "district" — match by option text against the place values you have. Only omit if none of the field's options matches any place value in userData.
+
+════════ DATES ════════
+Every date in userData has ALREADY been normalised to DD/MM/YYYY (day first, then month, then year) before it reached you. Trust that order — the first number is the DAY, the second is the MONTH. Never re-interpret a date as month-first.
+Reshape a date only to match what the target FIELD requires:
+- a text field showing DD/MM/YYYY or with no stated format -> pass it through unchanged
+- a field whose placeholder/pattern states another order (e.g. YYYY-MM-DD, DD-MM-YYYY) -> rearrange to match, keeping the same day, month and year
+- separate day / month / year fields or dropdowns -> split the value and put each part in its own field
+Never invent a missing part of a date, and never change which day or month the value refers to.
 
 ════════ WHAT COUNTS AS INVENTED (never output) ════════
 - Any value for a field about a topic the userData does not cover (e.g. education, employment, family, financial, or eligibility details that were never provided).
@@ -126,7 +141,7 @@ class Field(BaseModel):
     pattern: Optional[str] = None
     ariaLabel: Optional[str] = None
     previousHeading: Optional[str] = None
-    hint: Optional[str] = ""         # NEW: page helper text, e.g. "name as per 10th marksheet"
+    hint: Optional[str] = ""         # page helper text, e.g. "name as per 10th marksheet"
     tag: Optional[str] = "INPUT"
 
 
@@ -151,37 +166,148 @@ class FillResponse(BaseModel):
     fields_mapped: int
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  DATE NORMALISATION  (deterministic — no LLM involved)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+# A key is treated as a date if it mentions one of these...
+_DATE_KEY_HINTS = (
+    "date", "dob", "birthday", "issued", "admission",
+    "leaving", "validity", "expiry", "registration",
+)
+
+# ...unless it also mentions one of these (identifiers, places, names, and the
+# standalone day/month/year part-fields, which must NOT be rewritten).
+_DATE_KEY_EXCLUDE = (
+    "number", "_no", "_id", "authority", "place",
+    "district", "state", "taluka", "name", "status", "grade",
+)
+
+
+def _is_date_key(key: str) -> bool:
+    """Whitelist of keys whose values should be date-normalised."""
+    if not isinstance(key, str):
+        return False
+    k = key.lower()
+    # Standalone components (birthday_day, passing_year, ...) stay untouched.
+    if k.endswith("_year") or k.endswith("_month") or k.endswith("_day"):
+        return False
+    if any(x in k for x in _DATE_KEY_EXCLUDE):
+        return False
+    return any(h in k for h in _DATE_KEY_HINTS)
+
+
+def _four_digit_year(y: int) -> int:
+    if y >= 1000:
+        return y
+    if y < 100:
+        return 2000 + y if y <= 30 else 1900 + y   # 2-digit year window
+    return y
+
+
+def normalize_date(value: Any) -> Optional[str]:
+    """
+    Convert a printed date into canonical DD/MM/YYYY.
+    Returns None when the value is not recognisably a date, so the caller can
+    keep the original untouched. NEVER fabricates a missing part.
+
+    Indian documents are DAY-FIRST. Ambiguous all-numeric input therefore stays
+    day-first; only an impossible day (>12 in the month slot) triggers a swap.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    low = s.lower()
+
+    # 1. Worded: "16th day of April in the year 1998"
+    m = re.search(
+        r"(\d{1,2})\s*(?:st|nd|rd|th)?\s*(?:day\s+of\s+)?"
+        r"([A-Za-z]{3,9})\s*(?:,)?\s*(?:in\s+the\s+year\s+)?(\d{2,4})",
+        low,
+    )
+    if m and m.group(2) in _MONTHS:
+        d, mon, y = int(m.group(1)), _MONTHS[m.group(2)], _four_digit_year(int(m.group(3)))
+        if 1 <= d <= 31:
+            return f"{d:02d}/{mon:02d}/{y:04d}"
+
+    # 2. Day + month-name: "30 SEP 2014", "21-June-2005", "05 June, 2023"
+    m = re.search(r"(\d{1,2})\s*[-/.\s]\s*([A-Za-z]{3,9})\s*[-/.,\s]\s*(\d{2,4})", low)
+    if m and m.group(2) in _MONTHS:
+        d, mon, y = int(m.group(1)), _MONTHS[m.group(2)], _four_digit_year(int(m.group(3)))
+        if 1 <= d <= 31:
+            return f"{d:02d}/{mon:02d}/{y:04d}"
+
+    # 3. Month-name first: "April 16, 1998", "Sep 30 2014"
+    m = re.search(
+        r"([A-Za-z]{3,9})\s*[-/.\s]\s*(\d{1,2})\s*(?:st|nd|rd|th)?\s*[-/.,\s]\s*(\d{2,4})",
+        low,
+    )
+    if m and m.group(1) in _MONTHS:
+        mon, d, y = _MONTHS[m.group(1)], int(m.group(2)), _four_digit_year(int(m.group(3)))
+        if 1 <= d <= 31:
+            return f"{d:02d}/{mon:02d}/{y:04d}"
+
+    # 4. All-numeric: 16-01-2017, 14.06.2016, 09/09/2014, 5/6/2023, 16/01/17, 2014-09-09
+    m = re.search(r"(\d{1,4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,4})", s)
+    if m:
+        a, b, c = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if len(m.group(1)) == 4:                 # ISO: YYYY-MM-DD
+            y, mon, d = a, b, c
+        else:
+            d, mon, y = a, b, c
+            if d > 12 and mon > 12:
+                return None                      # nonsense, leave the original alone
+            if d <= 12 and mon > 12:
+                d, mon = mon, d                  # clearly month-first -> swap to day-first
+            y = _four_digit_year(y)
+        if 1 <= d <= 31 and 1 <= mon <= 12 and 1000 <= y <= 2999:
+            return f"{d:02d}/{mon:02d}/{y:04d}"
+
+    return None
+
+
+def _normalize_dates(data: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
+    """
+    Rewrite every date-ish value in userData to canonical DD/MM/YYYY.
+    Fails safe: a value that cannot be parsed is left exactly as it arrived.
+    """
+    if not isinstance(data, dict):
+        return data
+    out: Dict[str, Any] = {}
+    for k, v in data.items():
+        if _is_date_key(k) and isinstance(v, (str, int, float)):
+            fixed = normalize_date(v)
+            if fixed and fixed != str(v).strip():
+                print(f"[SESSION {session_id}] DATE NORMALISED {k}: {v!r} -> {fixed!r}")
+                out[k] = fixed
+                continue
+        out[k] = v
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 def _normalize_options(options: List[Any]) -> List[Any]:
     """Keep option objects intact but cap them for token safety."""
     return options[:25]
-
-
-def _lean_user_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    PAYLOAD TRIM: the mapper only needs the user's actual values.
-    Drops baggage the model never uses (formFillInstructions = stale old-path
-    output, processedDocuments = raw per-doc data already merged, formId = routing
-    id). Sends ONLY extractedFields (+ manual top-level values). Falls back to the
-    whole user_data if extractedFields isn't present, so nothing breaks whether the
-    payload is fat (old clients) or lean (trimmed popup.js).
-    """
-    if not isinstance(user_data, dict):
-        return user_data
-
-    extracted = user_data.get("extractedFields")
-    if isinstance(extracted, dict) and extracted:
-        lean = dict(extracted)
-        for k, v in user_data.items():
-            if k in ("extractedFields", "formFillInstructions", "processedDocuments", "formId"):
-                continue
-            if k not in lean and isinstance(v, (str, int, float, bool)):
-                lean[k] = v
-        return _clean_keys(lean)
-
-    return _clean_keys({
-        k: v for k, v in user_data.items()
-        if k not in ("formFillInstructions", "processedDocuments")
-    })
 
 
 def _clean_keys(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -207,6 +333,40 @@ def _clean_keys(data: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _lean_user_data(user_data: Dict[str, Any], session_id: str = "") -> Dict[str, Any]:
+    """
+    PAYLOAD TRIM: the mapper only needs the user's actual values.
+    Drops baggage the model never uses (formFillInstructions = stale old-path
+    output, processedDocuments = raw per-doc data already merged, formId = routing
+    id). Sends ONLY extractedFields (+ manual top-level values). Falls back to the
+    whole user_data if extractedFields isn't present, so nothing breaks whether the
+    payload is fat (old clients) or lean (trimmed popup.js).
+
+    Then applies key hygiene and DATE NORMALISATION, so the mapper always sees
+    clean keys and canonical DD/MM/YYYY dates.
+    """
+    if not isinstance(user_data, dict):
+        return user_data
+
+    extracted = user_data.get("extractedFields")
+    if isinstance(extracted, dict) and extracted:
+        lean = dict(extracted)
+        for k, v in user_data.items():
+            if k in ("extractedFields", "formFillInstructions", "processedDocuments", "formId"):
+                continue
+            if k not in lean and isinstance(v, (str, int, float, bool)):
+                lean[k] = v
+        return _normalize_dates(_clean_keys(lean), session_id)
+
+    return _normalize_dates(
+        _clean_keys({
+            k: v for k, v in user_data.items()
+            if k not in ("formFillInstructions", "processedDocuments")
+        }),
+        session_id,
+    )
+
+
 def _extract_mapping_json(raw: str) -> List[Dict]:
     """
     Robustly pull the mapping array out of a model response that may contain
@@ -218,29 +378,23 @@ def _extract_mapping_json(raw: str) -> List[Dict]:
 
     decoder = json.JSONDecoder()
 
-    # Scan for the first position where a JSON value actually starts and decodes.
     for i, ch in enumerate(raw):
         if ch not in "[{":
             continue
         try:
             value, _end = decoder.raw_decode(raw[i:])
         except ValueError:
-            continue  # not a valid JSON value starting here; keep scanning
+            continue
 
-        # Got one complete JSON value (ignoring anything after it).
         if isinstance(value, list):
             return value
         if isinstance(value, dict):
-            # array might be wrapped, e.g. {"mapping":[...]} or {"fields":[...]}
             for v in value.values():
                 if isinstance(v, list):
                     return v
-            # a single mapping object -> wrap it
             if "id" in value:
                 return [value]
-        # Not what we want; keep scanning for a later array.
 
-    # Last resort: try a plain load.
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
@@ -256,12 +410,12 @@ def _extract_mapping_json(raw: str) -> List[Dict]:
     return []
 
 
-def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None) -> List[Dict]:
+def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = None,
+             session_id: str = "") -> List[Dict]:
     api_key = os.environ.get(LLM_API_KEY_ENV, "")
     if not api_key:
         raise HTTPException(status_code=500, detail=f"{LLM_API_KEY_ENV} not set in environment")
 
-    # Build the field context the model maps against.
     fields_for_llm = []
     for f in fields:
         fid = f.get("id") or f.get("name")
@@ -277,13 +431,13 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
             "pattern":         f.get("pattern"),
             "ariaLabel":       f.get("ariaLabel"),
             "previousHeading": f.get("previousHeading"),
-            "hint":            f.get("hint", "") or "",   # NEW: the form's own instruction
+            "hint":            f.get("hint", "") or "",
         })
 
     if not fields_for_llm:
         return []
 
-    lean_user_data = _lean_user_data(user_data)
+    lean_user_data = _lean_user_data(user_data, session_id)
 
     prompt_data = {
         "fields":   fields_for_llm,
@@ -301,7 +455,6 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
             ],
             "temperature": 0.1,
         }
-        # Some models/providers reject response_format; make it toggleable.
         if USE_JSON_RESPONSE_FORMAT:
             payload["response_format"] = {"type": "json_object"}
 
@@ -317,7 +470,6 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
 
         resp_json = response.json()
 
-        # DEBUG: log the FULL raw provider response so we can see exactly what came back.
         print(f"[LLM RAW STATUS] {response.status_code}")
         print(f"[LLM RAW RESPONSE] {json.dumps(resp_json, ensure_ascii=False)[:4000]}")
 
@@ -328,12 +480,6 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
         print(f"[LLM MESSAGE CONTENT] {raw[:2000]}")
         raw = raw.replace("```json", "").replace("```", "").strip()
 
-        # ROBUST PARSE: the model (a reasoning model) sometimes emits the JSON
-        # array followed by extra text, or wraps it in an object, or prepends
-        # reasoning. Naive "first [ to last ]" slicing then fails with
-        # "Extra data". Instead, scan for the first '[' or '{' and use
-        # raw_decode to read exactly one complete JSON value, ignoring anything
-        # trailing.
         return _extract_mapping_json(raw)
 
     except HTTPException:
@@ -344,8 +490,9 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
 
 @app.get("/")
 def root():
-    return {"status": "FormPilot API running", "version": "3.1.0",
-            "provider": "cerebras", "model": LLM_MODEL, "hint_support": True}
+    return {"status": "FormPilot API running", "version": "3.2.0",
+            "provider": "cerebras", "model": LLM_MODEL,
+            "hint_support": True, "date_normalisation": True}
 
 
 @app.get("/health")
@@ -364,6 +511,16 @@ def debug():
         "key_length": len(key),
         "key_start": key[:8] if key else "empty",
     }
+
+
+@app.post("/debug/date")
+def debug_date(payload: Dict[str, Any]):
+    """
+    Quick sanity endpoint for the date normaliser.
+    POST {"value": "30 SEP 2014"} -> {"input": ..., "normalised": "30/09/2014"}
+    """
+    v = payload.get("value")
+    return {"input": v, "normalised": normalize_date(v)}
 
 
 @app.post("/fill", response_model=FillResponse)
@@ -387,7 +544,7 @@ def fill(req: FillRequest):
         if f.get("hint"):
             print(f"[SESSION {req.session_id}]   HINT {f.get('id')}: {f.get('hint')}")
 
-    raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num)
+    raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num, req.session_id)
 
     print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
           f"{json.dumps(raw_mapping, indent=2, ensure_ascii=False)}")
