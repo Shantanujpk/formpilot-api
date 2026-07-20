@@ -39,6 +39,7 @@ import requests
 import json
 import os
 import re
+import time
 
 app = FastAPI(title="FormPilot API", version="3.3.0")
 
@@ -49,12 +50,95 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PII-SAFE LOGGING
+# ═════════════════════════════════════════════════════════════════════════════
+#  This service handles Aadhaar numbers, PANs, dates of birth and names. Those
+#  were being printed in full to the platform logs on every single request
+#  ([RAW REQUEST BODY] logged the entire body). Platform logs are retained,
+#  searchable, and visible to anyone with dashboard access — so that was a live
+#  privacy exposure, not a theoretical one.
+#
+#  Three levels, set with DEBUG_LEVEL on Render:
+#    0  (default, PRODUCTION) — keys, counts and field ids only. NO values.
+#                               Still enough to see WHICH key mapped to WHICH
+#                               field, which is what most debugging needs.
+#    1  (safe to switch on temporarily) — values shown but identifiers MASKED:
+#                               Aadhaar -> XXXXXXXX2370, PAN -> XXXXX667B,
+#                               dates -> XX/XX/2000, email/phone masked.
+#    2  (LOCAL DEVELOPMENT ONLY) — everything raw. Never set this on a deployed
+#                               instance handling real documents.
+#
+#  Best practice for debugging: keep a set of SYNTHETIC test documents. With fake
+#  data, level 2 is harmless and you get full fidelity.
+
+DEBUG_LEVEL = int(os.environ.get("DEBUG_LEVEL", "0") or 0)
+
+_AADHAAR_RE = re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
+_PAN_RE     = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
+_DATE_RE    = re.compile(r"\b(\d{2})[/-](\d{2})[/-](\d{4})\b")
+_EMAIL_RE   = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
+_PHONE_RE   = re.compile(r"\b[6-9]\d{9}\b")
+_LONGNUM_RE = re.compile(r"\b\d{9,}\b")
+
+
+def _mask_text(s: str) -> str:
+    """Mask identifiers inside any string, keeping just enough to correlate."""
+    if not isinstance(s, str) or not s:
+        return s
+    s = _AADHAAR_RE.sub(lambda m: "XXXXXXXX" + m.group(0).replace(" ", "")[-4:], s)
+    s = _PAN_RE.sub(lambda m: "XXXXX" + m.group(0)[-4:], s)
+    s = _DATE_RE.sub(lambda m: f"XX/XX/{m.group(3)}", s)          # keep the year
+    s = _EMAIL_RE.sub(lambda m: m.group(0)[0] + "***@" + m.group(0).split("@")[-1], s)
+    s = _PHONE_RE.sub(lambda m: "XXXXXX" + m.group(0)[-4:], s)
+    s = _LONGNUM_RE.sub(lambda m: "X" * (len(m.group(0)) - 4) + m.group(0)[-4:], s)
+    return s
+
+
+def safe(value, force_level: int = None):
+    """
+    Render a value for logging at the current DEBUG_LEVEL.
+      0 -> a shape description only ("<str:19>"), never the content
+      1 -> the content with identifiers masked
+      2 -> raw
+    """
+    lvl = DEBUG_LEVEL if force_level is None else force_level
+    if lvl >= 2:
+        return value
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: safe(v, lvl) for k, v in value.items()}
+    if isinstance(value, list):
+        return [safe(v, lvl) for v in value]
+    if lvl <= 0:
+        t = type(value).__name__
+        n = len(str(value))
+        return f"<{t}:{n}>"
+    return _mask_text(str(value))
+
+
+def safe_json(obj, limit: int = 2000) -> str:
+    try:
+        return json.dumps(safe(obj), ensure_ascii=False)[:limit]
+    except Exception:
+        return "<unserialisable>"
+
+
 # ── RAW REQUEST LOGGER — catches request BEFORE Pydantic validation ──────────
 @app.middleware("http")
 async def log_raw_requests(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/fill":
+    # Previously printed the ENTIRE request body — Aadhaar number, DOB, full name,
+    # address — to the platform log on every request. Now gated behind DEBUG_LEVEL
+    # and masked even when enabled.
+    if request.method == "POST" and request.url.path == "/fill" and DEBUG_LEVEL >= 1:
         body = await request.body()
-        print(f"[RAW REQUEST BODY] {body.decode('utf-8')}")
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+            print(f"[RAW REQUEST BODY] {safe_json(parsed, 4000)}")
+        except Exception:
+            print(f"[RAW REQUEST BODY] <{len(body)} bytes, unparsed>")
     response = await call_next(request)
     return response
 
@@ -339,7 +423,9 @@ def _normalize_dates(data: Dict[str, Any], session_id: str = "") -> Dict[str, An
         if _is_date_key(k) and isinstance(v, (str, int, float)):
             fixed = normalize_date(v)
             if fixed and fixed != str(v).strip():
-                print(f"[SESSION {session_id}] DATE NORMALISED {k}: {v!r} -> {fixed!r}")
+                if DEBUG_LEVEL >= 1:
+                    print(f"[SESSION {session_id}] DATE NORMALISED {k}: "
+                          f"{_mask_text(str(v))!r} -> {_mask_text(fixed)!r}")
                 out[k] = fixed
                 continue
         out[k] = v
@@ -547,7 +633,8 @@ def _normalize_years(data: Dict[str, Any], session_id: str = "") -> Dict[str, An
             if re.fullmatch(r"\d{2}", s):
                 n = int(s)
                 fixed = str(2000 + n if n <= 30 else 1900 + n)
-                print(f"[SESSION {session_id}] YEAR NORMALISED {k}: {s!r} -> {fixed!r}")
+                if DEBUG_LEVEL >= 1:
+                    print(f"[SESSION {session_id}] YEAR NORMALISED {k}: {s!r} -> {fixed!r}")
                 out[k] = fixed
                 continue
         out[k] = v
@@ -876,6 +963,7 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
         if USE_JSON_RESPONSE_FORMAT:
             payload["response_format"] = {"type": "json_object"}
 
+        _t_llm = time.time()
         response = requests.post(
             LLM_URL,
             headers={
@@ -885,17 +973,21 @@ def call_llm(fields: List[Dict], user_data: Dict, entry_num: Optional[int] = Non
             json=payload,
             timeout=60,
         )
+        print(f"[TIMING] Cerebras call: {time.time() - _t_llm:.2f}s "
+              f"({len(fields_for_llm)} fields, {len(user_prompt)} prompt chars)")
 
         resp_json = response.json()
 
         print(f"[LLM RAW STATUS] {response.status_code}")
-        print(f"[LLM RAW RESPONSE] {json.dumps(resp_json, ensure_ascii=False)[:4000]}")
+        if DEBUG_LEVEL >= 1:
+            print(f"[LLM RAW RESPONSE] {safe_json(resp_json, 4000)}")
 
         if response.status_code != 200:
             raise HTTPException(status_code=502, detail=f"LLM error: {resp_json}")
 
         raw = resp_json["choices"][0]["message"]["content"].strip()
-        print(f"[LLM MESSAGE CONTENT] {raw[:2000]}")
+        if DEBUG_LEVEL >= 1:
+            print(f"[LLM MESSAGE CONTENT] {_mask_text(raw[:2000]) if DEBUG_LEVEL < 2 else raw[:2000]}")
         raw = raw.replace("```json", "").replace("```", "").strip()
 
         return _extract_mapping_json(raw)
@@ -928,6 +1020,8 @@ def debug():
         "key_set": bool(key and key != "NOT SET"),
         "key_length": len(key),
         "key_start": key[:8] if key else "empty",
+        "debug_level": DEBUG_LEVEL,
+        "pii_logging": ["off (keys only)", "masked values", "RAW - dev only"][min(DEBUG_LEVEL, 2)],
     }
 
 
@@ -943,6 +1037,7 @@ def debug_date(payload: Dict[str, Any]):
 
 @app.post("/fill", response_model=FillResponse)
 def fill(req: FillRequest):
+    _t_req = time.time()
     if not req.fields:
         raise HTTPException(status_code=400, detail="No fields provided")
     if not req.user_data:
@@ -958,9 +1053,10 @@ def fill(req: FillRequest):
     labelled = sum(1 for f in fields_dict if f.get("label"))
     hinted = sum(1 for f in fields_dict if f.get("hint"))
     print(f"[SESSION {req.session_id}] Context: {labelled}/{len(fields_dict)} labelled, {hinted} hinted")
-    for f in fields_dict:
-        if f.get("hint"):
-            print(f"[SESSION {req.session_id}]   HINT {f.get('id')}: {f.get('hint')}")
+    if DEBUG_LEVEL >= 1:
+        for f in fields_dict:
+            if f.get("hint"):
+                print(f"[SESSION {req.session_id}]   HINT {f.get('id')}: {f.get('hint')}")
 
     raw_mapping = call_llm(fields_dict, req.user_data, req.entry_num, req.session_id)
 
@@ -974,8 +1070,14 @@ def fill(req: FillRequest):
     except Exception as e:
         print(f"[SESSION {req.session_id}] provenance build failed: {e}")
 
-    print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
-          f"{json.dumps(raw_mapping, indent=2, ensure_ascii=False)}")
+    # At level 0 this prints only WHICH field got a value from WHICH source —
+    # no values at all — which is what most debugging actually needs.
+    if DEBUG_LEVEL <= 0:
+        summary = [f"{m.get('id')}<-{m.get('source') or '?'}" for m in raw_mapping]
+        print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)}): {summary}")
+    else:
+        print(f"[SESSION {req.session_id}] Mapping ({len(raw_mapping)} fields): "
+              f"{safe_json(raw_mapping, 4000)}")
 
     type_by_id = {}
     for f in fields_dict:
@@ -999,6 +1101,8 @@ def fill(req: FillRequest):
                 str(m.get("source") or ""), str(m["value"]), prov
             ),
         ))
+
+    print(f"[TIMING] /fill total: {time.time() - _t_req:.2f}s")
 
     return FillResponse(
         session_id      = req.session_id,
